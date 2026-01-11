@@ -1,0 +1,66 @@
+name: Autosync upstream
+
+on:
+  schedule:
+    - cron: "0 */18 * * *"   # every 18 hours
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Set upstream remote
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/duro92/ExtCloud.git
+
+      - name: Fetch upstream
+        run: git fetch upstream --prune
+
+      # ---------- MAIN (safe sync, history preserved) ----------
+
+      - name: Check main common ancestor
+        id: main_base
+        run: |
+          git checkout main
+          if ! git merge-base main upstream/main >/dev/null; then
+            echo "rewrite=true" >> $GITHUB_OUTPUT
+          else
+            echo "rewrite=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check main changes
+        id: main_diff
+        if: steps.main_base.outputs.rewrite == 'false'
+        run: |
+          if [ "$(git rev-list --count main..upstream/main)" -eq 0 ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync main
+        if: steps.main_diff.outputs.changed == 'true'
+        run: |
+          git merge upstream/main --no-edit
+          git push origin main
+
+      # ---------- BUILDS (force sync, history discarded) ----------
+
+      - name: Sync builds (force reset)
+        if: steps.main_diff.outputs.changed == 'true'
+        run: |
+          git checkout builds || git checkout -b builds
+          git reset --hard upstream/builds
+          git push origin builds --force
