@@ -8,14 +8,9 @@ Berikut adalah daftar ekstensi yang tersedia di repositori ExtCloud:
 
 | Nama Ekstensi | Status                            |
 | ------------- | --------------------------------- |
-| Animasu       | OK                                |
 | Anichin       | OK                                |
-| Animesail     | OK                                |
-| Anoboy        | OK                                |
-| DonghuaStream | OK                                |
 | Donghub       | OK                                |
 | Dutamovie     | OK                                |
-| Funmovieslix  | OK                                |
 | Fufafilm      | OK                                |
 | FilmApik      | OK                                |
 | Idlix         | OK                                |
@@ -36,7 +31,6 @@ Berikut adalah daftar ekstensi yang tersedia di repositori ExtCloud:
 | Pusatfilm     | OK                                |
 | Samehadeku    | OK                                |
 | SoraStream    | OK                                |
-| Zoronime      | OK                                |
 
 ## Cara Menggunakan
 
@@ -56,6 +50,9 @@ Berikut adalah daftar ekstensi yang tersedia di repositori ExtCloud:
 4.  Phisher98 : https://github.com/phisher98/cloudstream-extensions-phisher
 5.  Zeeorepo : https://github.com/funeelo/zeeorepo
 6.  Sofie99 : https://github.com/Sofie99/cloudstream-extensions-sofie
+
+
+
 
 
 
