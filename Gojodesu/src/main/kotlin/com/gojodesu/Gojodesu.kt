@@ -1,4 +1,4 @@
-package com.anoboy
+package com.gojodesu
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
@@ -9,10 +9,11 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URI
 
-class Anoboy : MainAPI() {
-    override var mainUrl = "http://anoboy.be"
-    override var name = "Anoboy👺"
+class Gojodesu : MainAPI() {
+    override var mainUrl = "https://gojodesu.com"
+    override var name = "Gojodeusu🤖"
     override val hasMainPage = true
     override var lang = "id"
 
@@ -46,6 +47,7 @@ class Anoboy : MainAPI() {
         "anime/?status=&type=&order=update" to "Update Terbaru",
         "anime/?sub=&order=latest" to "Baru Ditambahkan",
         "anime/?status=&type=&order=popular" to "Terpopuler",
+        "anime/?sub=&order=rating" to "Rating Terbaik",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -141,16 +143,18 @@ class Anoboy : MainAPI() {
             )
         }
 
-        val episodeElements = document.select("div.eplister ul li a")
-        val episodes = episodeElements
-            .reversed()
-            .mapIndexed { index, aTag ->
-                val href = fixUrl(aTag.attr("href"))
-                newEpisode(href) {
-                    name = "Episode ${index + 1}"
-                    episode = index + 1
-                }
+        val episodeItems = document.select("div.eplister ul li")
+        val episodes = episodeItems.mapNotNull { li ->
+            val aTag = li.selectFirst("a") ?: return@mapNotNull null
+            val epNum = li.selectFirst(".epl-num")?.text()?.filter { it.isDigit() }?.toIntOrNull()
+                ?: li.selectFirst(".epl-title")?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
+                ?: aTag.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
+            val epTitle = li.selectFirst(".epl-title")?.text()?.trim()
+            newEpisode(fixUrl(aTag.attr("href"))) {
+                name = epTitle ?: (epNum?.let { "Episode $it" } ?: "Episode")
+                episode = epNum
             }
+        }.sortedBy { it.episode ?: Int.MAX_VALUE }
 
         val altTitles = listOfNotNull(
             title,
@@ -216,11 +220,18 @@ class Anoboy : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
+        fun refererFromUrl(url: String, fallback: String): String {
+            return runCatching {
+                val uri = URI(url)
+                if (uri.host.isNullOrBlank()) fallback else "${uri.scheme}://${uri.host}/"
+            }.getOrElse { fallback }
+        }
 
         document.selectFirst("div.player-embed iframe")
             ?.getIframeAttr()
             ?.let { iframe ->
-                loadExtractor(httpsify(iframe), data, subtitleCallback, callback)
+                val src = httpsify(iframe)
+                loadExtractor(src, refererFromUrl(src, data), subtitleCallback, callback)
             }
 
         val mirrorOptions = document.select("select.mirror option[value]:not([disabled])")
@@ -237,7 +248,8 @@ class Anoboy : MainAPI() {
                     else -> null
                 }
                 if (!mirrorUrl.isNullOrBlank()) {
-                    loadExtractor(httpsify(mirrorUrl), data, subtitleCallback, callback)
+                    val src = httpsify(mirrorUrl)
+                    loadExtractor(src, refererFromUrl(src, data), subtitleCallback, callback)
                 }
             } catch (_: Exception) {
                 // ignore broken mirrors
@@ -270,4 +282,3 @@ class Anoboy : MainAPI() {
             ?: this?.attr("src")
     }
 }
-

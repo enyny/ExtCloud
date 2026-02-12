@@ -1,4 +1,4 @@
-package com.anoboy
+package com.gojodesu
 
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -6,8 +6,10 @@ import com.lagradost.cloudstream3.plugins.Plugin
 
 
 @CloudstreamPlugin
-class AnoboyPlugin : Plugin() {
+class GojodesuPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(Anoboy())
+        registerMainAPI(Gojodesu())
+        registerExtractorAPI(Kotakajaib())
+        registerExtractorAPI(Emturbovid())
     }
 }
