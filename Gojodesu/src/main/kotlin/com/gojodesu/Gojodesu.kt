@@ -4,8 +4,8 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
-import com.lagradost.cloudstream3.LoadResponse.Companion.addScore
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.LoadResponse.Companion.addScore
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -220,18 +220,18 @@ class Gojodesu : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        fun refererFromUrl(url: String, fallback: String): String {
-            return runCatching {
-                val uri = URI(url)
-                if (uri.host.isNullOrBlank()) fallback else "${uri.scheme}://${uri.host}/"
-            }.getOrElse { fallback }
+
+        fun getBaseUrl(url: String): String {
+            return URI(url).let { "${it.scheme}://${it.host}/" }
         }
 
         document.selectFirst("div.player-embed iframe")
             ?.getIframeAttr()
             ?.let { iframe ->
                 val src = httpsify(iframe)
-                loadExtractor(src, refererFromUrl(src, data), subtitleCallback, callback)
+                // Samakan dengan Pusatfilm: referer = base host dari iframe
+                // (beberapa embed butuh referer host mereka sendiri).
+                loadExtractor(src, getBaseUrl(src), subtitleCallback, callback)
             }
 
         val mirrorOptions = document.select("select.mirror option[value]:not([disabled])")
@@ -249,7 +249,7 @@ class Gojodesu : MainAPI() {
                 }
                 if (!mirrorUrl.isNullOrBlank()) {
                     val src = httpsify(mirrorUrl)
-                    loadExtractor(src, refererFromUrl(src, data), subtitleCallback, callback)
+                    loadExtractor(src, getBaseUrl(src), subtitleCallback, callback)
                 }
             } catch (_: Exception) {
                 // ignore broken mirrors
@@ -260,7 +260,8 @@ class Gojodesu : MainAPI() {
         for (a in downloadLinks) {
             val url = a.attr("href").trim()
             if (url.isNotBlank()) {
-                loadExtractor(httpsify(url), data, subtitleCallback, callback)
+                val src = httpsify(url)
+                loadExtractor(src, getBaseUrl(src), subtitleCallback, callback)
             }
         }
 
