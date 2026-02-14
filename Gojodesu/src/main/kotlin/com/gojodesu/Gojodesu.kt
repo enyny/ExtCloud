@@ -213,76 +213,49 @@ class Gojodesu : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(
+override suspend fun loadLinks(
     data: String,
     isCasting: Boolean,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ): Boolean {
+    val doc = app.get(data).document
 
-    fun absUrl(base: String, url: String): String {
-        return if (url.startsWith("http")) url else base.trimEnd('/') + "/" + url.trimStart('/')
+    fun refererOf(embedUrl: String): String =
+        getBaseUrl(embedUrl).trimEnd('/') + "/"
+
+    fun pickIframeSrc(d: org.jsoup.nodes.Document): String? {
+        val iframeEl = d.selectFirst("div.player-embed iframe, iframe")
+        return listOf("src", "data-src", "data-litespeed-src")
+            .firstNotNullOfOrNull { k -> iframeEl?.attr(k)?.takeIf { it.isNotBlank() } }
+            ?.let { httpsify(it) }
     }
 
-    suspend fun parsePage(pageUrl: String) {
-        val doc = app.get(pageUrl).document
+    pickIframeSrc(doc)?.let { embed ->
+        loadExtractor(embed, refererOf(embed), subtitleCallback, callback)
+    }
 
-        // 1) Iframe utama (player-embed)
-        val iframe = doc.selectFirst("div.player-embed iframe")
-        val rawSrc = iframe?.attr("src").takeIf { !it.isNullOrBlank() }
-            ?: iframe?.attr("data-src").takeIf { !it.isNullOrBlank() }
+    val mirrorPages = doc.select("select.mirror option[value]:not([disabled])")
+        .map { it.attr("value").trim() }
+        .filter { it.isNotBlank() && !it.equals("Select Video Server", true) }
 
-        rawSrc?.let { s ->
-            val src = httpsify(s)
-
-            // Penting: banyak host (termasuk yang mengarah ke emturbovid) butuh referer = pageUrl (gojodesu)
-            loadExtractor(src, pageUrl, subtitleCallback, callback)
-
-            // Kadang ada host yang justru butuh referer = host embednya, jadi kasih fallback juga
-            val embedBase = URI(src).let { "${it.scheme}://${it.host}/" }
-            loadExtractor(src, embedBase, subtitleCallback, callback)
-        }
-
-        // 2) Mirror (Gojodesu: option.value itu URL page lain, bukan base64)
-        val mirrors = doc.select("select.mirror option[value]:not([disabled])")
-            .map { it.attr("value").trim() }
-            .filter { it.isNotBlank() && !it.equals("Select Video Server", true) }
-
-        for (m in mirrors) {
-            try {
-                val mirrorPageUrl = httpsify(absUrl("https://gojodesu.com", m))
-                // Mirror itu halaman lain yang punya iframe sendiri → fetch & parse juga
-                val mDoc = app.get(mirrorPageUrl).document
-                val mIframe = mDoc.selectFirst("div.player-embed iframe")
-
-                val mRaw = mIframe?.attr("src").takeIf { !it.isNullOrBlank() }
-                    ?: mIframe?.attr("data-src").takeIf { !it.isNullOrBlank() }
-
-                mRaw?.let { s ->
-                    val src = httpsify(s)
-                    loadExtractor(src, mirrorPageUrl, subtitleCallback, callback)
-
-                    val embedBase = URI(src).let { "${it.scheme}://${it.host}/" }
-                    loadExtractor(src, embedBase, subtitleCallback, callback)
-                }
-            } catch (_: Exception) {
-                // skip mirror rusak
-            }
-        }
-
-        // 3) Download links (biarkan, optional)
-        doc.select("div.dlbox a[href]").forEach { a ->
-            val url = a.attr("href").trim()
-            if (url.isNotBlank()) {
-                val src = httpsify(url)
-                loadExtractor(src, pageUrl, subtitleCallback, callback)
-            }
+    for (page in mirrorPages) {
+        runCatching {
+            val pageUrl = httpsify(page)
+            val mDoc = app.get(pageUrl).document
+            val mEmbed = pickIframeSrc(mDoc) ?: return@runCatching
+            loadExtractor(mEmbed, refererOf(mEmbed), subtitleCallback, callback)
         }
     }
 
-    parsePage(data)
     return true
 }
+
+    private fun getBaseUrl(url: String): String {
+            val u = httpsify(url)
+            val m = Regex("""^(https?://[^/]+)""", RegexOption.IGNORE_CASE).find(u)
+            return m?.groupValues?.get(1) ?: mainUrl
+    }
 
     private fun Element.getImageAttr(): String {
         return when {

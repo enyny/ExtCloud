@@ -13,6 +13,7 @@ import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.EmturbovidExtractor
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.httpsify
 import org.jsoup.Jsoup
 import java.net.URI
 import java.util.Collections
@@ -37,7 +38,6 @@ open class Kotakajaib : ExtractorApi() {
     ) {
         val document = app.get(url, referer = referer).document
 
-        // Embed servers (data-frame)
         val links = document.select("ul#dropdown-server li a")
         for (a in links) {
             loadExtractor(
@@ -54,3 +54,6 @@ class Emturbovid : EmturbovidExtractor() {
     override var name = "Emturbovid"
     override var mainUrl = "https://turbovidhls.com"
 }
+
+
+
