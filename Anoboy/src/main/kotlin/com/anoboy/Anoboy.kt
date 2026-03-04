@@ -18,9 +18,7 @@ class Anoboy : MainAPI() {
     override var lang = "id"
 
     override val supportedTypes = setOf(
-        TvType.Anime,
-        TvType.AnimeMovie,
-        TvType.OVA
+        TvType.Anime
     )
 
     companion object {
@@ -45,6 +43,7 @@ class Anoboy : MainAPI() {
 
     override val mainPage = mainPageOf(
         "anime/" to "Baru Ditambahkan",
+        "anime/ongoing/" to "Ongoing",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -72,6 +71,8 @@ class Anoboy : MainAPI() {
         if (title.isBlank()) return null
 
         val isMovie = link.contains("/anime-movie/", true) || title.contains("movie", true)
+        val isOva = title.contains("ova", true) || title.contains("special", true)
+        if (isMovie || isOva) return null
         val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
         val poster = selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) }
 
@@ -85,6 +86,9 @@ class Anoboy : MainAPI() {
         val title = selectFirst("div.tt")?.text()?.trim()
             ?: selectFirst("a")?.attr("title")?.trim()
             ?: return null
+        val isMovie = link.contains("/anime-movie/", true) || title.contains("movie", true)
+        val isOva = title.contains("ova", true) || title.contains("special", true)
+        if (isMovie || isOva) return null
         val poster = selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) }
         return newAnimeSearchResponse(title, fixUrl(link), TvType.Anime) {
             posterUrl = poster
@@ -114,6 +118,8 @@ class Anoboy : MainAPI() {
             ?: return null
 
         val isMovie = href.contains("/anime-movie/", true) || title.contains("movie", true)
+        val isOva = title.contains("ova", true) || title.contains("special", true)
+        if (isMovie || isOva) return null
         val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
         val posterUrl = selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) }
 
@@ -192,23 +198,148 @@ class Anoboy : MainAPI() {
         val castList = emptyList<ActorData>()
 
         val episodeElements = document.select("div.singlelink ul.lcp_catlist li a, div.eplister ul li a")
-        val episodes = episodeElements
+        val seasonHeaders = document.select("div.hq")
+
+        fun normalizeTitle(raw: String): String {
+            var titleText = raw.trim()
+            titleText = titleText.replace("\\[(Streaming|Download)\\]".toRegex(RegexOption.IGNORE_CASE), "")
+            titleText = titleText.replace("(Streaming|Download)".toRegex(RegexOption.IGNORE_CASE), "")
+            return titleText.trim()
+        }
+
+        fun filterStreamingIfAvailable(elements: List<Element>): List<Element> {
+            val hasStreamingOrDownload = elements.any { anchor ->
+                val text = anchor.text()
+                val href = anchor.attr("href")
+                text.contains("streaming", true) ||
+                    text.contains("download", true) ||
+                    href.contains("streaming", true) ||
+                    href.contains("download", true)
+            }
+            return if (hasStreamingOrDownload) {
+                elements.filter { anchor ->
+                    val text = anchor.text()
+                    val href = anchor.attr("href")
+                    text.contains("streaming", true) || href.contains("streaming", true)
+                }
+            } else {
+                elements
+            }
+        }
+
+        val seasonGroups = buildList {
+            for (header in seasonHeaders) {
+                val seasonNum = Regex("Season\\s*(\\d+)", RegexOption.IGNORE_CASE)
+                    .find(header.text())
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+                var sibling = header.nextElementSibling()
+                while (sibling != null &&
+                    !sibling.hasClass("singlelink") &&
+                    !sibling.hasClass("eplister")
+                ) {
+                    sibling = sibling.nextElementSibling()
+                }
+                val anchors = sibling
+                    ?.select("ul.lcp_catlist li a, ul li a")
+                    ?.toList()
+                    ?: emptyList()
+                if (anchors.isNotEmpty()) {
+                    add(seasonNum to anchors)
+                }
+            }
+        }
+
+        val groupedElements = if (seasonGroups.isNotEmpty()) {
+            seasonGroups.flatMap { (seasonNum, anchors) ->
+                filterStreamingIfAvailable(anchors).map { seasonNum to it }
+            }
+        } else {
+            filterStreamingIfAvailable(episodeElements.toList()).map { null to it }
+        }
+
+        val episodes = groupedElements
             .reversed()
-            .mapIndexed { index, aTag ->
+            .mapIndexed { index, (seasonNum, aTag) ->
                 val href = fixUrl(aTag.attr("href"))
-                val titleText = aTag.text().trim()
+                val rawTitle = aTag.text().trim()
+                val cleanedTitle = normalizeTitle(rawTitle)
                 val episodeNumber = Regex("Episode\\s*(\\d+)", RegexOption.IGNORE_CASE)
-                    .find(titleText)
+                    .find(rawTitle)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+                    ?: Regex("episode[-\\s]?(\\d+)", RegexOption.IGNORE_CASE)
+                        .find(href)
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        ?.toIntOrNull()
+                    ?: if (seasonNum != null && !rawTitle.contains("Episode", true)) 1 else (index + 1)
+
+                newEpisode(href) {
+                    name = if (cleanedTitle.isBlank()) "Episode $episodeNumber" else cleanedTitle
+                    episode = episodeNumber
+                    if (seasonNum != null) this.season = seasonNum
+                }
+            }
+
+        fun isValidEpisodeUrl(raw: String?): Boolean {
+            val clean = raw?.trim().orEmpty()
+            return clean.isNotBlank() &&
+                clean != "#" &&
+                !clean.equals("none", true) &&
+                !clean.startsWith("javascript", true)
+        }
+
+        fun buildServerEpisodes(doc: org.jsoup.nodes.Document): List<Episode> {
+            val serverGroups = doc.select("div.satu, div.dua, div.tiga, div.empat, div.lima, div.enam")
+            val anchors = serverGroups.flatMap { group -> group.select("a[data-video]") }
+            val fallbackAnchors = if (anchors.isNotEmpty()) anchors else doc.select("a[data-video]")
+            if (fallbackAnchors.isEmpty()) return emptyList()
+
+            val episodesByNumber = LinkedHashMap<Int, MutableList<Pair<String, String>>>()
+            fallbackAnchors.forEachIndexed { index, anchor ->
+                val dataVideo = anchor.attr("data-video").ifBlank { anchor.attr("href") }
+                if (!isValidEpisodeUrl(dataVideo)) return@forEachIndexed
+
+                val rawTitle = anchor.text().trim()
+                val episodeNumber = Regex("(\\d+)")
+                    .find(rawTitle)
                     ?.groupValues
                     ?.getOrNull(1)
                     ?.toIntOrNull()
                     ?: (index + 1)
+                val resolvedUrl = fixUrl(dataVideo)
+                val cleanedTitle = normalizeTitle(rawTitle)
 
-                newEpisode(href) {
-                    name = if (titleText.isBlank()) "Episode $episodeNumber" else titleText
-                    episode = episodeNumber
-                }
+                episodesByNumber
+                    .getOrPut(episodeNumber) { mutableListOf() }
+                    .add(resolvedUrl to cleanedTitle)
             }
+
+            return episodesByNumber
+                .toSortedMap()
+                .mapNotNull { (episodeNumber, entries) ->
+                    val urls = entries.map { it.first }.distinct()
+                    val title = entries.map { it.second }.firstOrNull { it.isNotBlank() }
+                        ?: "Episode $episodeNumber"
+                    if (urls.isEmpty()) return@mapNotNull null
+
+                    val data = if (urls.size == 1) urls.first() else {
+                        "multi::" + urls.joinToString("||")
+                    }
+
+                    newEpisode(data) {
+                        name = title
+                        episode = episodeNumber
+                    }
+                }
+        }
+
+        val serverEpisodes = buildServerEpisodes(document)
+        val useServerEpisodes = seasonHeaders.isEmpty() && serverEpisodes.isNotEmpty() && episodes.size <= 1
+        val finalEpisodes = if (useServerEpisodes) serverEpisodes else episodes
 
         val altTitles = listOfNotNull(
             title,
@@ -240,7 +371,7 @@ class Anoboy : MainAPI() {
 
         val tracker = APIHolder.getTracker(altTitles, TrackerType.getTypes(type), year, true)
 
-        return if (episodes.isNotEmpty()) {
+        return if (finalEpisodes.isNotEmpty()) {
             newAnimeLoadResponse(title, url, type) {
                 posterUrl = tracker?.image ?: poster
                 backgroundPosterUrl = tracker?.cover
@@ -250,7 +381,7 @@ class Anoboy : MainAPI() {
                 showStatus = status
                 this.recommendations = recommendations
                 this.duration = duration ?: 0
-                addEpisodes(DubStatus.Subbed, episodes)
+                addEpisodes(DubStatus.Subbed, finalEpisodes)
                 rating?.let { addScore(it.toString(), 10) }
                 addActors(actors)
                 if (castList.isNotEmpty()) this.actors = castList
@@ -283,7 +414,9 @@ class Anoboy : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val multiPrefix = "multi::"
+        val isMulti = data.startsWith(multiPrefix)
+        val document = if (isMulti) null else app.get(data).document
         val discoveredUrls = linkedSetOf<String>()
         val queuedUrls = ArrayDeque<String>()
         val crawledUrls = mutableSetOf<String>()
@@ -326,19 +459,35 @@ class Anoboy : MainAPI() {
             doc.select("a[href*=\"yourupload.com/embed/\"], a[href*=\"yourupload.com/watch/\"], a[href*=\"www.yourupload.com/embed/\"], a[href*=\"www.yourupload.com/watch/\"]")
                 .forEach { queueUrl(it.attr("href"), baseUrl) }
 
-            doc.select("#fplay a#allmiror[data-video], #fplay a[data-video], a#allmiror[data-video], a[data-video]")
+            doc.select("#fplay a#allmiror[data-video], #fplay a[data-video], a#allmiror[data-video], a[data-video], [data-video]")
                 .forEach { anchor ->
                     queueUrl(anchor.attr("data-video"), baseUrl)
                     queueUrl(anchor.attr("href"), baseUrl)
+                }
+
+            doc.select("[data-embed], [data-iframe], [data-url], [data-src]")
+                .forEach { el ->
+                    queueUrl(el.attr("data-embed"), baseUrl)
+                    queueUrl(el.attr("data-iframe"), baseUrl)
+                    queueUrl(el.attr("data-url"), baseUrl)
+                    queueUrl(el.attr("data-src"), baseUrl)
                 }
 
             doc.select("div.download a.udl[href], div.download a[href], div.dlbox li span.e a[href]")
                 .forEach { queueUrl(it.attr("href"), baseUrl) }
 
             val bloggerRegex = Regex("""https?://(?:www\.)?blogger\.com/video\.g\?[^"'<\s]+""", RegexOption.IGNORE_CASE)
+            val batchRegex = Regex("""/uploads/(?:adsbatch[^"'\s]+|yupbatch[^"'\s]+)""", RegexOption.IGNORE_CASE)
+            val yourUploadRegex = Regex("""https?://(?:www\.)?yourupload\.com/(?:embed|watch)/[^"'<\s]+""", RegexOption.IGNORE_CASE)
             doc.select("script").forEach { script ->
                 val scriptData = script.data()
                 bloggerRegex.findAll(scriptData).forEach { match ->
+                    queueUrl(match.value, baseUrl)
+                }
+                batchRegex.findAll(scriptData).forEach { match ->
+                    queueUrl(match.value, baseUrl)
+                }
+                yourUploadRegex.findAll(scriptData).forEach { match ->
                     queueUrl(match.value, baseUrl)
                 }
             }
@@ -350,10 +499,20 @@ class Anoboy : MainAPI() {
             if (lower.endsWith(".mp4") || lower.endsWith(".m3u8")) return false
             return lower.contains("anoboy.boo") ||
                 lower.contains("/uploads/") ||
-                lower.contains("adsbatch")
+                lower.contains("adsbatch") ||
+                lower.contains("yupbatch")
         }
 
-        extractFromDoc(data, document)
+        if (document != null) {
+            extractFromDoc(data, document)
+        }
+        if (isMulti) {
+            data.removePrefix(multiPrefix)
+                .split("||")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .forEach { queueUrl(it, mainUrl) }
+        }
 
         var safety = 0
         while (queuedUrls.isNotEmpty() && safety++ < 120) {
@@ -367,7 +526,7 @@ class Anoboy : MainAPI() {
             }
         }
 
-        if (discoveredUrls.isEmpty()) {
+        if (discoveredUrls.isEmpty() && document != null) {
             // fallback for old mirrored options stored as base64 iframe html
             val mirrorOptions = document.select("select.mirror option[value]:not([disabled])")
             for (opt in mirrorOptions) {
@@ -400,15 +559,12 @@ class Anoboy : MainAPI() {
             callback(link)
         }
 
-        // Try Blogger first, but if current Blogger extractor fails, continue with all other mirrors.
+        // Try Blogger first, then continue with all other mirrors so users can switch sources.
         bloggerLinks.distinct().forEach { link ->
             loadExtractor(link, data, subtitleCallback, callbackWrapper)
         }
-
-        if (foundLinks == 0) {
-            fallbackLinks.distinct().forEach { link ->
-                loadExtractor(link, data, subtitleCallback, callbackWrapper)
-            }
+        fallbackLinks.distinct().forEach { link ->
+            loadExtractor(link, data, subtitleCallback, callbackWrapper)
         }
 
         return true

@@ -3,6 +3,7 @@ package com.hexated
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.USER_AGENT
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.Hxfile
@@ -11,7 +12,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.extractors.VidStack
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.getAndUnpack
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import java.net.URL
 
 open class Gdplayer : ExtractorApi() {
     override val name = "Gdplayer"
@@ -72,10 +77,29 @@ class Nontonanimeid : Hxfile() {
     override val requiresReferer = true
 }
 
-class EmbedKotakAnimeid : Hxfile() {
+open class KotakAnimeidBase : ExtractorApi() {
+    override val name = "KotakAnimeid"
+    override val mainUrl = "https://kotakanimeid.link"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
+        val response = app.get(url, referer = referer)
+        val html = response.text
+        val document = response.document
+        val origin = originOf(url)
+        val pageUrl = url
+
+        val sources = mutableListOf<ExtractorLink>()
+        sources.addAll(extractStreamSources(html, pageUrl, origin))
+        sources.addAll(extractScriptSources(document, pageUrl, origin))
+
+        return sources.distinctBy { it.url }
+    }
+}
+
+class EmbedKotakAnimeid : KotakAnimeidBase() {
     override val name = "EmbedKotakAnimeid"
     override val mainUrl = "https://embed2.kotakanimeid.com"
-    override val requiresReferer = true
 }
 
 class Kotaksb : Hxfile() {
@@ -84,10 +108,14 @@ class Kotaksb : Hxfile() {
     override val requiresReferer = true
 }
 
-class KotakAnimeidCom : Hxfile() {
+class KotakAnimeidCom : KotakAnimeidBase() {
     override val name = "KotakAnimeid"
     override val mainUrl = "https://kotakanimeid.com"
-    override val requiresReferer = true
+}
+
+class KotakAnimeidLink : KotakAnimeidBase() {
+    override val name = "KotakAnimeid"
+    override val mainUrl = "https://kotakanimeid.link"
 }
 
 class Vidhidepre : Filesim() {
@@ -100,3 +128,133 @@ class Rpmvip : VidStack() {
     override var mainUrl = "https://s1.rpmvip.com"
     override var requiresReferer = true
 }
+
+private suspend fun extractStreamSources(
+    html: String,
+    pageUrl: String,
+    origin: String
+): List<ExtractorLink> {
+    val urls = collectStreamUrls(html)
+    return buildLinksFromUrls(urls, pageUrl, origin)
+}
+
+private suspend fun extractScriptSources(
+    document: org.jsoup.nodes.Document,
+    pageUrl: String,
+    origin: String
+): List<ExtractorLink> {
+    val sources = mutableListOf<ExtractorLink>()
+    document.select("script").forEach { script ->
+        val data = script.data()
+        if (data.contains("eval(function(p,a,c,k,e,d)")) {
+            val unpacked = getAndUnpack(data)
+            sources.addAll(buildLinksFromUrls(collectStreamUrls(unpacked), pageUrl, origin))
+            val src = unpacked.substringAfter("sources:[").substringBefore("]")
+            tryParseJson<List<ResponseSource>>("[$src]")?.forEach { source ->
+                sources.add(
+                    newExtractorLink(
+                        "KotakAnimeid",
+                        "KotakAnimeid",
+                        source.file,
+                        INFER_TYPE
+                    ) {
+                        this.referer = pageUrl
+                        this.headers = (headers ?: emptyMap()) + mapOf(
+                            "Referer" to pageUrl,
+                            "Origin" to origin,
+                            "User-Agent" to USER_AGENT
+                        )
+                        this.quality = getQualityFromName(source.label)
+                    }
+                )
+            }
+        } else if (data.contains("\"sources\":[")) {
+            sources.addAll(buildLinksFromUrls(collectStreamUrls(data), pageUrl, origin))
+            val src = data.substringAfter("\"sources\":[").substringBefore("]")
+            tryParseJson<List<ResponseSource>>("[$src]")?.forEach { source ->
+                sources.add(
+                    newExtractorLink(
+                        "KotakAnimeid",
+                        "KotakAnimeid",
+                        source.file,
+                        INFER_TYPE
+                    ) {
+                        this.referer = pageUrl
+                        this.headers = (headers ?: emptyMap()) + mapOf(
+                            "Referer" to pageUrl,
+                            "Origin" to origin,
+                            "User-Agent" to USER_AGENT
+                        )
+                        this.quality = when {
+                            source.label?.contains("HD") == true -> Qualities.P720.value
+                            source.label?.contains("SD") == true -> Qualities.P480.value
+                            else -> getQualityFromName(source.label)
+                        }
+                    }
+                )
+            }
+        } else {
+            sources.addAll(buildLinksFromUrls(collectStreamUrls(data), pageUrl, origin))
+        }
+    }
+    return sources
+}
+
+private fun collectStreamUrls(text: String): List<String> {
+    val cleaned = text.replace("\\\\/", "/").replace("\\/", "/")
+    val urls = LinkedHashSet<String>()
+    val pattern =
+        Regex("""https?://[^\s"'\\]+?\.(m3u8|mp4|mkv|webm)(\?[^\s"'\\]*)?""",
+            RegexOption.IGNORE_CASE
+        )
+    pattern.findAll(cleaned).forEach { match ->
+        urls.add(match.value)
+    }
+    val patternRelative =
+        Regex("""//[^\s"'\\]+?\.(m3u8|mp4|mkv|webm)(\?[^\s"'\\]*)?""",
+            RegexOption.IGNORE_CASE
+        )
+    patternRelative.findAll(cleaned).forEach { match ->
+        urls.add(normalizeUrl(match.value))
+    }
+    return urls.toList()
+}
+
+private suspend fun buildLinksFromUrls(
+    urls: List<String>,
+    pageUrl: String,
+    origin: String
+): List<ExtractorLink> {
+    if (urls.isEmpty()) return emptyList()
+    return urls
+        .map { link ->
+            newExtractorLink(
+                "KotakAnimeid",
+                "KotakAnimeid",
+                link,
+                INFER_TYPE
+            ) {
+                this.referer = pageUrl
+                this.headers = (headers ?: emptyMap()) + mapOf(
+                    "Referer" to pageUrl,
+                    "Origin" to origin,
+                    "User-Agent" to USER_AGENT
+                )
+            }
+        }
+}
+
+private fun normalizeUrl(url: String): String {
+    return if (url.startsWith("//")) "https:$url" else url
+}
+
+private fun originOf(url: String): String {
+    val parsed = URL(url)
+    return "${parsed.protocol}://${parsed.host}"
+}
+
+private data class ResponseSource(
+    @JsonProperty("file") val file: String,
+    @JsonProperty("type") val type: String? = null,
+    @JsonProperty("label") val label: String? = null
+)
