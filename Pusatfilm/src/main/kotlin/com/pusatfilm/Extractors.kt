@@ -395,16 +395,23 @@ open class Kotakajaib : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val document = runCatching {
+        suspend fun fetchDocWith(ref: String) = runCatching {
             app.get(
                 pageUrl,
-                referer = referer,
+                referer = ref,
                 headers = mapOf(
                     "User-Agent" to "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
                     "Accept" to "*/*"
                 )
             ).document
-        }.getOrNull() ?: return
+        }.getOrNull()
+
+        var document = fetchDocWith(referer) ?: return
+        val hasServerButton = document.selectFirst("button.server-item[data-frame], button.server-item[data-url], button.server-item[data-src]") != null
+        if (!hasServerButton) {
+            // kotakajaib embed checks referrer host; retry with known whitelisted referrer.
+            document = fetchDocWith("https://v3.pusatfilm21info.com/") ?: document
+        }
         val visited = linkedSetOf<String>()
         // Many embeds (including gdriveplayer.to) validate referer. Use the kotakajaib embed page as referer.
         val downstreamReferer = pageUrl
@@ -612,189 +619,7 @@ open class Kotakajaib : ExtractorApi() {
     }
 }
 
-open class EmturbovidExtractor : ExtractorApi() {
-    override var name = "Emturbovid"
-    override var mainUrl = "https://emturbovid.com"
-    override val requiresReferer = true
 
-    private val mobileUa =
-        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-
-    private fun getBaseUrl(url: String?): String? = runCatching {
-        if (url.isNullOrBlank()) return@runCatching null
-        val u = URI(url)
-        val scheme = u.scheme ?: return@runCatching null
-        val host = u.host ?: return@runCatching null
-        val port = if (u.port != -1) ":${u.port}" else ""
-        "$scheme://$host$port"
-    }.getOrNull()
-
-    private fun normalizeReferer(url: String?): String? {
-        if (url.isNullOrBlank()) return null
-        return if (url.endsWith("/")) url else "$url/"
-    }
-
-    private fun isAbsoluteUrl(url: String): Boolean {
-        return url.startsWith("http://", true) || url.startsWith("https://", true)
-    }
-
-    private fun resolveUrl(base: String, value: String): String {
-        return runCatching {
-            URI(base).resolve(value).toString()
-        }.getOrElse { value }
-    }
-
-    private fun extractAllM3u8Candidates(html: String, doc: Document, pageUrl: String): List<String> {
-        val found = linkedSetOf<String>()
-
-        fun add(raw: String?) {
-            val v = raw?.trim()?.trim('"', '\'', ' ')
-            if (v.isNullOrBlank()) return
-            if (!v.contains(".m3u8", ignoreCase = true) && !v.contains("/data", ignoreCase = true)) return
-            found += if (isAbsoluteUrl(v)) v else resolveUrl(pageUrl, v)
-        }
-
-        // Common patterns
-        Regex("""https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.value) }
-
-        Regex("""["']([^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.groupValues.getOrNull(1)) }
-
-        Regex("""file\s*:\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.groupValues.getOrNull(1)) }
-
-        Regex("""src\s*:\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.groupValues.getOrNull(1)) }
-
-        Regex("""urlPlay\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.groupValues.getOrNull(1)) }
-
-        Regex("""data-hash\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(html)
-            .forEach { add(it.groupValues.getOrNull(1)) }
-
-        doc.select("[src]").forEach { add(it.attr("src")) }
-        doc.select("[data-src]").forEach { add(it.attr("data-src")) }
-        doc.select("[data-hash]").forEach { add(it.attr("data-hash")) }
-
-        return found.toList()
-    }
-
-    private fun scoreCandidate(url: String): Int {
-        val u = url.lowercase()
-        return when {
-            "cdn1.turboviplay.com/data" in u -> 100
-            "cdn." in u && "turboviplay" in u && ".m3u8" in u -> 95
-            "turboviplay.com/data" in u -> 90
-            "turbovidhls.com" in u && ".m3u8" in u -> 80
-            "turbosplayer.com" in u && "master.m3u8" in u -> 60
-            ".m3u8" in u -> 40
-            else -> 0
-        }
-    }
-
-    private suspend fun loadEmbedPage(targetUrl: String, ref: String) = runCatching {
-        val headers = mapOf(
-            "User-Agent" to mobileUa,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Referer" to ref
-        )
-        app.get(targetUrl, headers = headers, referer = ref)
-    }.getOrNull()
-
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        val fallbackRef = "https://kotakajaib.me/"
-        val initialRef = referer ?: fallbackRef
-
-        // 1) buka page awal
-        var page = loadEmbedPage(url, initialRef)
-
-        // 2) retry pakai referer kotakajaib kalau perlu
-        if (page == null) {
-            page = loadEmbedPage(url, fallbackRef)
-        }
-
-        if (page == null) return null
-
-        // 3) kalau page awal belum sampai ke host final, coba akses ulang pakai URL final hasil redirect
-        // biasanya emturbovid -> turbovidhls
-        val finalPageUrl = page.url
-        val finalPageBase = getBaseUrl(finalPageUrl) ?: mainUrl
-
-        val html = page.text
-        val doc = page.document
-
-        // 4) cari kandidat stream dari HTML
-        val candidates = extractAllM3u8Candidates(html, doc, finalPageUrl)
-            .sortedByDescending { scoreCandidate(it) }
-
-        var best = candidates.firstOrNull()
-
-        // 5) kalau yang ketemu masih /t/..., buka sekali lagi halaman itu dan extract ulang
-        if (!best.isNullOrBlank() && !best.contains(".m3u8", ignoreCase = true) && best.contains("/t/", ignoreCase = true)) {
-            val nestedPage = loadEmbedPage(best, fallbackRef)
-            if (nestedPage != null) {
-                val nestedCandidates = extractAllM3u8Candidates(
-                    nestedPage.text,
-                    nestedPage.document,
-                    nestedPage.url
-                ).sortedByDescending { scoreCandidate(it) }
-
-                if (nestedCandidates.isNotEmpty()) {
-                    best = nestedCandidates.first()
-                }
-            }
-        }
-
-        // 6) fallback: kalau HTML tidak berisi m3u8, coba bentuk pattern umum data3 dari id /t/{id}
-        if (best.isNullOrBlank()) {
-            val videoId = Regex("""/t/([A-Za-z0-9]+)""")
-                .find(finalPageUrl)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?: Regex("""/t/([A-Za-z0-9]+)""")
-                    .find(url)
-                    ?.groupValues
-                    ?.getOrNull(1)
-
-            if (!videoId.isNullOrBlank()) {
-                best = "https://cdn1.turboviplay.com/data3/$videoId/$videoId.m3u8"
-            }
-        }
-
-        if (best.isNullOrBlank()) return null
-
-        // Playback harus tetap pakai referer page, bukan referer master variant g239/g263
-        val playbackReferer = normalizeReferer(finalPageUrl) ?: normalizeReferer(finalPageBase) ?: "$mainUrl/"
-        val playbackOrigin = finalPageBase
-
-        val streamHeaders = linkedMapOf(
-            "Referer" to playbackReferer,
-            "Origin" to playbackOrigin,
-            "User-Agent" to mobileUa,
-            "Accept" to "*/*"
-        )
-
-        return listOf(
-            newExtractorLink(
-                source = name,
-                name = name,
-                url = best,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.referer = playbackReferer
-                this.headers = streamHeaders
-                this.quality = Qualities.Unknown.value
-            }
-        )
-    }
-}
 
 /**
  * gdriveplayer.to has multiple implementations floating around in Cloudstream.
