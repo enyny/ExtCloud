@@ -1,6 +1,7 @@
 package com.hexated
 
 import android.annotation.SuppressLint
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
@@ -181,6 +182,18 @@ class AnimeSailProvider : MainAPI() {
 
                 when {
                     iframe.endsWith(".mp4", ignoreCase = true) || iframe.endsWith(".m3u8", ignoreCase = true) -> {
+                        val isMp4UploadDirect = iframe.contains("mp4upload.com", ignoreCase = true)
+                        val directReferer = if (isMp4UploadDirect) "https://www.mp4upload.com/" else mainUrl
+                        val directHeaders = if (isMp4UploadDirect) {
+                            mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to directReferer,
+                                "Origin" to "https://www.mp4upload.com"
+                            )
+                        } else {
+                            emptyMap()
+                        }
+
                         callback.invoke(
                             newExtractorLink(
                                 source = serverName,
@@ -188,8 +201,9 @@ class AnimeSailProvider : MainAPI() {
                                 url = iframe,
                                 type = if (iframe.endsWith(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                             ) {
-                                referer = mainUrl
+                                referer = directReferer
                                 this.quality = quality
+                                this.headers = directHeaders
                             }
                         )
                     }
@@ -281,6 +295,8 @@ class AnimeSailProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        if (tryLoadMp4UploadDirect(url, serverName, quality, callback)) return
+
         loadExtractor(url, referer, subtitleCallback) { link ->
             val finalName =
                 if (serverName.equals(link.name, ignoreCase = true)) link.name else "$serverName - ${link.name}"
@@ -293,7 +309,7 @@ class AnimeSailProvider : MainAPI() {
                         url = link.url,
                         type = link.type
                     ) {
-                        this.referer = link.referer ?: referer ?: mainUrl
+                        this.referer = link.referer.takeIf { it.isNotBlank() } ?: referer ?: mainUrl
                         this.quality =
                             if (link.type == ExtractorLinkType.M3U8) link.quality else quality
                                 ?: Qualities.Unknown.value
@@ -305,6 +321,78 @@ class AnimeSailProvider : MainAPI() {
         }
     }
 
+    private suspend fun tryLoadMp4UploadDirect(
+        url: String,
+        serverName: String,
+        quality: Int?,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val id = Regex("""mp4upload\.com/(?:embed-)?([A-Za-z0-9]+)(?:\.html)?""", RegexOption.IGNORE_CASE)
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
+            ?: return false
+
+        val downloadUrl = "https://www.mp4upload.com/dl?op=download2&id=$id"
+        val watchReferer = "https://www.mp4upload.com/"
+        val redirect = runCatching {
+            app.get(
+                downloadUrl,
+                referer = watchReferer,
+                allowRedirects = false,
+                headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to watchReferer,
+                    "Origin" to "https://www.mp4upload.com"
+                )
+            )
+        }.getOrNull() ?: return false
+
+        val location = redirect.headers["Location"] ?: redirect.headers["location"]
+        val finalUrl = when {
+            location.isNullOrBlank() -> return false
+            location.startsWith("http://", true) || location.startsWith("https://", true) -> location
+            location.startsWith("//") -> "https:$location"
+            location.startsWith("/") -> "https://www.mp4upload.com$location"
+            else -> return false
+        }
+
+        val probe = runCatching {
+            app.get(
+                finalUrl,
+                referer = watchReferer,
+                headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to watchReferer,
+                    "Origin" to "https://www.mp4upload.com",
+                    "Range" to "bytes=0-4095"
+                )
+            )
+        }.getOrNull() ?: return false
+
+        val contentType = (probe.headers["Content-Type"] ?: probe.headers["content-type"]).orEmpty().lowercase()
+        if (!(contentType.contains("octet-stream") || contentType.contains("video"))) return false
+
+        callback.invoke(
+            newExtractorLink(
+                source = "Mp4Upload",
+                name = serverName,
+                url = finalUrl,
+                type = INFER_TYPE
+            ) {
+                this.referer = watchReferer
+                this.quality = quality ?: Qualities.Unknown.value
+                this.headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to watchReferer,
+                    "Origin" to "https://www.mp4upload.com"
+                )
+            }
+        )
+        return true
+    }
+
     private fun getIndexQuality(str: String): Int {
         return Regex("(\\d{3,4})[pP]").find(str)?.groupValues?.getOrNull(1)?.toIntOrNull()
             ?: Qualities.Unknown.value
@@ -313,6 +401,36 @@ class AnimeSailProvider : MainAPI() {
 }
 
 class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") : Interceptor {
+    private fun clearCookie(cookieManager: CookieManager, domainUrl: String, name: String) {
+        cookieManager.setCookie(domainUrl, "$name=; Max-Age=0; path=/")
+    }
+
+    private fun mergeCookieHeaders(first: String?, second: String?): String {
+        return listOfNotNull(first, second)
+            .flatMap { it.split(";") }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString("; ")
+    }
+
+    private fun isChallengePage(response: Response): Boolean {
+        if (response.code == 403 || response.code == 503) return true
+        if (!response.isSuccessful) return false
+
+        val contentType = response.header("Content-Type").orEmpty().lowercase()
+        if (!contentType.contains("text/html")) return false
+
+        val html = runCatching { response.peekBody(256_000).string().lowercase() }.getOrDefault("")
+        if (html.isBlank()) return false
+
+        return html.contains("cf-turnstile") ||
+            html.contains("challenge-platform") ||
+            html.contains("checking your browser") ||
+            html.contains("just a moment") ||
+            html.contains(targetCookie)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun intercept(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -333,7 +451,7 @@ class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") :
 
             initialResponse = chain.proceed(requestBuilder.build())
 
-            if (initialResponse.code == 403 || initialResponse.code == 503) {
+            if (isChallengePage(initialResponse)) {
                 needsRefresh = true
                 initialResponse.close()
             } else {
@@ -354,6 +472,11 @@ class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") :
                         val newWebView = WebView(context)
                         webView = newWebView
 
+                        cookieManager.setAcceptCookie(true)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                            cookieManager.setAcceptThirdPartyCookies(newWebView, true)
+                        }
+
                         newWebView.settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
@@ -363,7 +486,10 @@ class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") :
 
                         newWebView.webViewClient = WebViewClient()
 
-                        cookieManager.setCookie(domainUrl, "$targetCookie=; Max-Age=0")
+                        clearCookie(cookieManager, domainUrl, targetCookie)
+                        clearCookie(cookieManager, domainUrl, "cf_clearance")
+                        clearCookie(cookieManager, domainUrl, "__cf_bm")
+                        clearCookie(cookieManager, domainUrl, "__cfseq")
                         cookieManager.flush()
 
                         newWebView.loadUrl(url)
@@ -373,12 +499,12 @@ class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") :
                 }
 
                 var attempts = 0
-                val maxAttempts = 15
+                val maxAttempts = 30
                 while (attempts < maxAttempts) {
                     Thread.sleep(1000)
                     val checkCookies = cookieManager.getCookie(domainUrl) ?: ""
 
-                    if (checkCookies.contains(targetCookie)) {
+                    if (checkCookies.contains(targetCookie) || checkCookies.contains("cf_clearance")) {
                         cookieManager.flush()
                         break
                     }
@@ -396,9 +522,10 @@ class TurnstileInterceptor(private val targetCookie: String = "_as_turnstile") :
             }
 
             currentCookies = cookieManager.getCookie(domainUrl) ?: ""
+            val mergedCookies = mergeCookieHeaders(originalRequest.header("Cookie"), currentCookies)
             val newRequestBuilder = originalRequest.newBuilder()
                 .header("User-Agent", userAgent)
-                .header("Cookie", currentCookies)
+                .header("Cookie", mergedCookies)
 
             return chain.proceed(newRequestBuilder.build())
         }

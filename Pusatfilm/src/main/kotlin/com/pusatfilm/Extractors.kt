@@ -3,6 +3,7 @@ package com.pusatfilm
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64Decode
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -12,11 +13,15 @@ import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.nicehttp.RequestBodyTypes
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 
 private data class CryptoJsAesJson(
@@ -539,38 +544,190 @@ open class Kotakajaib : ExtractorApi() {
 
     private suspend fun resolveRedirectPageIfDirect(url: String, referer: String): String? {
         // Only attempt for common intermediate links. If a page requires interaction, we bail out.
-        val host = runCatching { java.net.URI(url).host ?: "" }.getOrDefault("")
-        if (host.isBlank()) return null
-        val lowerHost = host.lowercase()
-        val mightBeIntermediate = lowerHost.contains("ouo.") || lowerHost.contains("ouo-") || lowerHost.contains("ouo")
-        if (!mightBeIntermediate) return null
+        fun isOuoHost(host: String?): Boolean {
+            val h = host?.lowercase().orEmpty()
+            return h.contains("ouo.io") || h.contains("ouo.press") || h.contains("ouo-")
+        }
+        fun resolveAgainst(base: String, target: String): String? = runCatching {
+            when {
+                target.startsWith("http://", true) || target.startsWith("https://", true) -> target
+                target.startsWith("//") -> "https:$target"
+                else -> java.net.URI(base).resolve(target).toString()
+            }
+        }.getOrNull()
 
-        val resp = runCatching { app.get(url, referer = referer, allowRedirects = false) }.getOrNull() ?: return null
-        val html = runCatching { resp.text }.getOrNull()?.trim().orEmpty()
-        if (html.isBlank()) return null
+        val firstHost = runCatching { java.net.URI(url).host }.getOrNull()
+        if (!isOuoHost(firstHost)) return null
 
-        // If it looks like an interaction page, don't proceed.
-        if (html.contains("I'M A HUMAN", ignoreCase = true) ||
-            html.contains("I am human", ignoreCase = true) ||
-            html.contains("captcha", ignoreCase = true) ||
-            html.contains("g-recaptcha", ignoreCase = true)
-        ) return null
+        var current = url
+        repeat(4) {
+            val resp = runCatching {
+                app.get(
+                    current,
+                    referer = referer,
+                    allowRedirects = false,
+                    headers = mapOf(
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    )
+                )
+            }.getOrNull() ?: return null
 
-        // meta refresh: <meta http-equiv="refresh" content="1;url=https://...">
-        Regex("""http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s]+)""", RegexOption.IGNORE_CASE)
-            .find(html)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.let { return it }
+            val location = resp.headers["Location"] ?: resp.headers["location"]
+            if (!location.isNullOrBlank()) {
+                val next = resolveAgainst(current, location) ?: return null
+                val nextHost = runCatching { java.net.URI(next).host }.getOrNull()
+                if (!isOuoHost(nextHost)) return next
+                current = next
+                return@repeat
+            }
 
-        // plain link in body
-        Regex("""<a[^>]+href=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .find(html)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.let { return it }
+            val html = runCatching { resp.text }.getOrNull()?.trim().orEmpty()
+            if (html.isBlank()) return null
 
+            // If it looks like an interaction/challenge page, don't proceed.
+            if (html.contains("I'M A HUMAN", ignoreCase = true) ||
+                html.contains("I am human", ignoreCase = true) ||
+                html.contains("captcha", ignoreCase = true) ||
+                html.contains("g-recaptcha", ignoreCase = true) ||
+                html.contains("cf-turnstile", ignoreCase = true)
+            ) return null
+
+            val nextCandidate = Regex(
+                """http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s]+)""",
+                RegexOption.IGNORE_CASE
+            ).find(html)?.groupValues?.getOrNull(1)
+                ?: Regex("""location\.(?:href|replace)\(['"]([^'"]+)['"]\)""", RegexOption.IGNORE_CASE)
+                    .find(html)?.groupValues?.getOrNull(1)
+                ?: Regex("""<a[^>]+href=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(html)?.groupValues?.getOrNull(1)
+
+            val next = nextCandidate?.let { resolveAgainst(current, it) } ?: return null
+            val nextHost = runCatching { java.net.URI(next).host }.getOrNull()
+            if (!isOuoHost(nextHost)) return next
+            current = next
+        }
         return null
+    }
+
+    private fun isFilepressHost(host: String?): Boolean {
+        val h = host?.lowercase().orEmpty()
+        return h.endsWith("filepress.wiki") || h.endsWith("filebee.xyz")
+    }
+
+    private fun normalizeFilepressValue(value: String, method: String): String? {
+        val raw = value.trim()
+        if (raw.isBlank()) return null
+        if (raw.startsWith("http://", true) || raw.startsWith("https://", true)) return raw
+        val looksLikeMongoId = Regex("""^[a-f0-9]{24}$""", RegexOption.IGNORE_CASE).matches(raw)
+        return when (method) {
+            "publicDownlaod", "publicUserDownlaod", "gpDirectDownlaod" ->
+                if (looksLikeMongoId) null else "https://drive.google.com/uc?id=$raw"
+            "privateDownlaod" ->
+                if (looksLikeMongoId) null else "https://drive.google.com/file/d/$raw/view"
+            else -> null
+        }
+    }
+
+    private suspend fun tryExtractFilepress(
+        pageUrl: String,
+        quality: Int?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val fileId = Regex("""/file/([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
+            .find(pageUrl)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
+            ?: return false
+
+        val base = runCatching {
+            val u = java.net.URI(pageUrl)
+            "${u.scheme ?: "https"}://${u.host}"
+        }.getOrNull() ?: return false
+
+        val apiUrl = "$base/api/file/downlaod"
+        val methods = listOf(
+            "publicDownlaod",
+            "publicUserDownlaod",
+            "privateDownlaod",
+            "indexDownlaod",
+            "cloudDownlaod",
+            "gpDirectDownlaod",
+            "telegramDownload"
+        )
+
+        val visited = linkedSetOf<String>()
+        var emitted = false
+
+        suspend fun emitCandidate(candidateRaw: String?, method: String) {
+            val normalized = candidateRaw?.let { normalizeFilepressValue(it, method) } ?: return
+            if (!visited.add(normalized)) return
+
+            var linked = false
+            loadExtractor(normalized, pageUrl, subtitleCallback) { link ->
+                linked = true
+                emitted = true
+                callback(link)
+            }
+
+            if (!linked && Regex("""\.(m3u8|mp4|mkv|webm)(\?|$)""", RegexOption.IGNORE_CASE).containsMatchIn(normalized)) {
+                emitted = true
+                callback.invoke(
+                    newExtractorLink(
+                        source = "Filepress",
+                        name = if (quality != null) "Filepress ${quality}p" else "Filepress",
+                        url = normalized
+                    ) {
+                        this.referer = pageUrl
+                        this.quality = quality ?: Qualities.Unknown.value
+                    }
+                )
+            }
+        }
+
+        for (method in methods) {
+            val body = mapOf(
+                "id" to fileId,
+                "method" to method,
+                "captchaValue" to ""
+            ).toJson().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+
+            val responseText = runCatching {
+                app.post(
+                    apiUrl,
+                    referer = pageUrl,
+                    headers = mapOf(
+                        "Origin" to base,
+                        "Referer" to pageUrl,
+                        "Accept" to "application/json, text/plain, */*",
+                        "X-Requested-With" to "XMLHttpRequest"
+                    ),
+                    requestBody = body
+                ).text
+            }.getOrNull() ?: continue
+
+            val payload = runCatching { JSONObject(responseText) }.getOrNull() ?: continue
+            if (!payload.optBoolean("status", false)) continue
+            val data = payload.opt("data") ?: continue
+
+            when (data) {
+                is String -> emitCandidate(data, method)
+                is JSONArray -> {
+                    for (i in 0 until data.length()) {
+                        emitCandidate(data.optString(i), method)
+                    }
+                }
+                is JSONObject -> {
+                    emitCandidate(data.optString("url"), method)
+                    emitCandidate(data.optString("link"), method)
+                    emitCandidate(data.optString("id"), method)
+                }
+            }
+        }
+
+        return emitted
     }
 
     private suspend fun emitOrExtract(
@@ -587,16 +744,22 @@ open class Kotakajaib : ExtractorApi() {
         }
 
         var handled = false
+        val host = runCatching { java.net.URI(fixed).host?.lowercase() }.getOrNull()
 
         // gdriveplayer.to is often served in a way that breaks the upstream AES-based extractor.
         // Handle the observed embed2.php -> hlsplaylist.php -> hlsnew2.php flow directly.
-        if (runCatching { java.net.URI(fixed).host?.lowercase() }.getOrNull() == "gdriveplayer.to") {
+        if (host == "gdriveplayer.to") {
             if (tryExtractGdriveplayer(fixed, referer, quality, callback)) return
+        }
+
+        // Filepress/Filebee frequently wraps final links via their own API.
+        if (isFilepressHost(host)) {
+            if (tryExtractFilepress(fixed, quality, subtitleCallback, callback)) return
         }
 
         // Pixeldrain pages are not always handled by loadExtractor in all builds.
         // If we can map /u/{id} -> /api/file/{id}, emit it directly.
-        if (runCatching { java.net.URI(fixed).host?.lowercase() }.getOrNull() == "pixeldrain.com") {
+        if (host == "pixeldrain.com") {
             val idFromPath = Regex("""/u/([A-Za-z0-9]+)""").find(fixed)?.groupValues?.getOrNull(1)
             val id = idFromPath ?: runCatching {
                 val doc = app.get(fixed, referer = referer).document
