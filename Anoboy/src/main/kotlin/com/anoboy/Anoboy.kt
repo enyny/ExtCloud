@@ -292,11 +292,74 @@ class Anoboy : MainAPI() {
                 !clean.startsWith("javascript", true)
         }
 
+        fun parseEpisodeNumber(rawTitle: String, sourceUrl: String?): Int? {
+            val fromTitle = Regex("\\b(?:episode|ep)\\s*[-:]?\\s*(\\d+)\\b", RegexOption.IGNORE_CASE)
+                .find(rawTitle)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+            if (fromTitle != null) return fromTitle
+
+            val fromBtHd = Regex("\\bbt\\s*-?\\s*hd\\s*[-:]?\\s*(\\d+)\\b", RegexOption.IGNORE_CASE)
+                .find(rawTitle)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+            if (fromBtHd != null) return fromBtHd
+
+            val fromData = sourceUrl?.let { link ->
+                Regex("[?&](?:data5|ep|episode)=(\\d+)", RegexOption.IGNORE_CASE)
+                    .find(link)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+            }
+            if (fromData != null) return fromData
+
+            return null
+        }
+
+        fun isQualityOnlyLabel(rawTitle: String): Boolean {
+            val label = rawTitle.trim()
+            if (label.isBlank()) return false
+            if (Regex("\\b(?:episode|ep|ova|special)\\b", RegexOption.IGNORE_CASE).containsMatchIn(label)) {
+                return false
+            }
+            if (Regex("\\bbt\\s*-?\\s*hd\\b", RegexOption.IGNORE_CASE).containsMatchIn(label)) {
+                return false
+            }
+            return Regex("\\b(?:\\d{3,4}p?|240|360|480|720|1080|1k|2k|4k)\\b", RegexOption.IGNORE_CASE)
+                .containsMatchIn(label) ||
+                Regex("\\bpc\\s*\\d+\\b", RegexOption.IGNORE_CASE).containsMatchIn(label) ||
+                Regex("\\b\\d+\\s*-\\s*\\d+\\b").containsMatchIn(label)
+        }
+
+        val episodeNumberFromUrl = Regex("(?:episode|ep)[-\\s]?(\\d+)", RegexOption.IGNORE_CASE)
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?: Regex("\\b(?:episode|ep)\\s*(\\d+)\\b", RegexOption.IGNORE_CASE)
+                .find(title)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+
         fun buildServerEpisodes(doc: org.jsoup.nodes.Document): List<Episode> {
             val serverGroups = doc.select("div.satu, div.dua, div.tiga, div.empat, div.lima, div.enam")
             val anchors = serverGroups.flatMap { group -> group.select("a[data-video]") }
             val fallbackAnchors = if (anchors.isNotEmpty()) anchors else doc.select("a[data-video]")
             if (fallbackAnchors.isEmpty()) return emptyList()
+
+            val hasExplicitEpisodeLabels = fallbackAnchors.any { anchor ->
+                val rawTitle = anchor.text().trim()
+                val sourceUrl = anchor.attr("data-video").ifBlank { anchor.attr("href") }
+                parseEpisodeNumber(rawTitle, sourceUrl) != null
+            }
+            val qualityLikeCount = fallbackAnchors.count { isQualityOnlyLabel(it.text()) }
+            val shouldCollapseToSingleEpisode = episodeNumberFromUrl != null &&
+                !hasExplicitEpisodeLabels &&
+                qualityLikeCount >= (fallbackAnchors.size - 1).coerceAtLeast(1)
 
             val episodesByNumber = LinkedHashMap<Int, MutableList<Pair<String, String>>>()
             fallbackAnchors.forEachIndexed { index, anchor ->
@@ -304,14 +367,17 @@ class Anoboy : MainAPI() {
                 if (!isValidEpisodeUrl(dataVideo)) return@forEachIndexed
 
                 val rawTitle = anchor.text().trim()
-                val episodeNumber = Regex("(\\d+)")
-                    .find(rawTitle)
-                    ?.groupValues
-                    ?.getOrNull(1)
-                    ?.toIntOrNull()
-                    ?: (index + 1)
+                val episodeNumber = when {
+                    shouldCollapseToSingleEpisode -> episodeNumberFromUrl
+                    else -> parseEpisodeNumber(rawTitle, dataVideo)
+                        ?: if (isQualityOnlyLabel(rawTitle) && episodeNumberFromUrl != null && fallbackAnchors.size <= 6) {
+                            episodeNumberFromUrl
+                        } else {
+                            index + 1
+                        }
+                }
                 val resolvedUrl = fixUrl(dataVideo)
-                val cleanedTitle = normalizeTitle(rawTitle)
+                val cleanedTitle = if (shouldCollapseToSingleEpisode) "" else normalizeTitle(rawTitle)
 
                 episodesByNumber
                     .getOrPut(episodeNumber) { mutableListOf() }
@@ -431,7 +497,11 @@ class Anoboy : MainAPI() {
 
         fun resolveUrl(raw: String?, base: String): String? {
             if (!isValidUrl(raw)) return null
-            val clean = raw!!.trim()
+            var clean = raw!!.trim()
+            // Some legacy Anoboy acbatch pages output broken query values where '+' becomes ' '.
+            if (clean.contains("/uploads/stream/", true) && clean.contains("data=", true)) {
+                clean = clean.replace(" ", "+")
+            }
             return try {
                 when {
                     clean.startsWith("http://", true) || clean.startsWith("https://", true) -> clean
@@ -459,6 +529,15 @@ class Anoboy : MainAPI() {
             doc.select("a[href*=\"yourupload.com/embed/\"], a[href*=\"yourupload.com/watch/\"], a[href*=\"www.yourupload.com/embed/\"], a[href*=\"www.yourupload.com/watch/\"]")
                 .forEach { queueUrl(it.attr("href"), baseUrl) }
 
+            doc.select(
+                "a[href*=\"/uploads/stream/embed.php\"], " +
+                    "a[href*=\"/uploads/acbatch.php\"], " +
+                    "a[href*=\"/uploads/adsbatch\"], " +
+                    "a[href*=\"/uploads/yupbatch\"], " +
+                    "a[href*=\"blogger.com/video.g\"], " +
+                    "a[href*=\"blogger.googleusercontent.com\"]"
+            ).forEach { queueUrl(it.attr("href"), baseUrl) }
+
             doc.select("#fplay a#allmiror[data-video], #fplay a[data-video], a#allmiror[data-video], a[data-video], [data-video]")
                 .forEach { anchor ->
                     queueUrl(anchor.attr("data-video"), baseUrl)
@@ -477,7 +556,7 @@ class Anoboy : MainAPI() {
                 .forEach { queueUrl(it.attr("href"), baseUrl) }
 
             val bloggerRegex = Regex("""https?://(?:www\.)?blogger\.com/video\.g\?[^"'<\s]+""", RegexOption.IGNORE_CASE)
-            val batchRegex = Regex("""/uploads/(?:adsbatch[^"'\s]+|yupbatch[^"'\s]+)""", RegexOption.IGNORE_CASE)
+            val batchRegex = Regex("""/uploads/(?:adsbatch[^"'\s]+|yupbatch[^"'\s]+|acbatch[^"'\s]+|stream/embed\.php\?[^"'\s]+)""", RegexOption.IGNORE_CASE)
             val yourUploadRegex = Regex("""https?://(?:www\.)?yourupload\.com/(?:embed|watch)/[^"'<\s]+""", RegexOption.IGNORE_CASE)
             doc.select("script").forEach { script ->
                 val scriptData = script.data()

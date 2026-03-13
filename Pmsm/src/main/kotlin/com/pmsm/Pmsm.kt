@@ -182,6 +182,14 @@ class Pmsm : MainAPI() {
             }.getOrNull() ?: return@forEach
 
             val embedRaw = response.embedUrl ?: return@forEach
+            if (response.type.equals("ztshcode", true)) {
+                val token = decodeZtshcodeToken(embedRaw)
+                if (!token.isNullOrBlank()) {
+                    emitExtractor("https://yandexcdn.com/f/$token")
+                    emitExtractor("https://yandexcdn.com/e/$token")
+                    return@forEach
+                }
+            }
             val embedUrl = extractEmbedUrl(embedRaw) ?: return@forEach
             emitExtractor(embedUrl)
         }
@@ -350,6 +358,27 @@ class Pmsm : MainAPI() {
         }
     }
 
+    private fun decodeZtshcodeToken(raw: String): String? {
+        val encoded = Regex("""<div[^>]+id=["']([0-9a-fA-F]+)["']""")
+            .find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?: return null
+
+        val decoded = buildString {
+            encoded.chunked(3).forEach { chunk ->
+                chunk.toIntOrNull(16)?.let { append(it.toChar()) }
+            }
+        }
+        if (decoded.isBlank()) return null
+
+        return Regex("""["']v["']\s*:\s*["']([a-zA-Z0-9_-]+)["']""")
+            .find(decoded)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+
     private fun extractYear(text: String?): Int? {
         return Regex("""(19|20)\d{2}""").find(text.orEmpty())?.value?.toIntOrNull()
     }
@@ -366,3 +395,4 @@ class Pmsm : MainAPI() {
         @param:JsonProperty("msg") val msg: String? = null
     )
 }
+

@@ -47,3 +47,6 @@ class Ezplayer : VidStack() {
     override var requiresReferer = true
 }
 
+class YandexcdnPmsm : VidhideExtractor() {
+    override var mainUrl = "https://yandexcdn.com"
+}
